@@ -1,9 +1,12 @@
 """
-Step 3 — Citation Linking
+Step 3 — Citation Linking (OpenAlex)
 
-Queries Semantic Scholar in batch for references and citations of all papers
-in your library. Matches returned papers against the library. Updates the
-"Related Papers" section of each note with bidirectional links.
+Queries OpenAlex for references of all papers in your library. Matches returned
+papers against the library. Updates the "Related Papers" section of each note
+with bidirectional links.
+
+No API key needed — OpenAlex is free. A polite-pool email is included in
+every request (required for higher rate limits).
 
 Auto-generated links are tagged <!--auto--> so they can be distinguished from
 user-written links and updated/removed on subsequent runs.
@@ -21,12 +24,12 @@ import argparse
 import difflib
 import json
 import logging
-import random
 import re
 import shutil
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime
 from pathlib import Path
@@ -38,11 +41,13 @@ from pathlib import Path
 
 PROJECT_DIR = Path(__file__).parent
 LOG_FILE = PROJECT_DIR / "obsidian_writer.log"
-CACHE_FILE = PROJECT_DIR / "s2_cache.json"
+CACHE_FILE = PROJECT_DIR / "s2_cache.json"   # kept same name for continuity
 
-S2_BATCH_URL = "https://api.semanticscholar.org/graph/v1/paper/batch"
-S2_SEARCH_URL = "https://api.semanticscholar.org/graph/v1/paper/search"
-S2_BATCH_SIZE = 500
+OPENALEX_BASE = "https://api.openalex.org/works"
+OPENALEX_BATCH_SIZE = 50          # max DOIs per filter query
+OPENALEX_MAILTO = "anand.guitarist@gmail.com"
+OPENALEX_SLEEP = 0.15             # ~7 req/sec — well within polite-pool 10/sec limit
+OPENALEX_SELECT = "id,doi,title,referenced_works"
 
 STEP3_REQUIRED_KEYS = [
     "zotero_user_id",
@@ -88,46 +93,38 @@ def load_config(log: logging.Logger) -> dict:
 # ---------------------------------------------------------------------------
 
 _DOI_LINE_RE = re.compile(r'\*\*DOI\*\*:.*\[([^\]]+)\]')
-_DATE_ADDED_RE = re.compile(r'\*\*Date Added\*\*:\s*(\S+)')
 
 
 def _normalise_title(title: str) -> str:
     return " ".join(re.sub(r"[^\w\s]", " ", title.lower()).split())
 
 
-def build_library_index(output_folder: Path, log: logging.Logger) -> tuple[dict, dict, dict]:
+def build_library_index(output_folder: Path, log: logging.Logger) -> tuple[dict, dict]:
     """Parse all .md notes and build lookup indexes.
 
     Returns:
-        doi_index   — {lowercase_doi: note_stem (title without .md)}
+        doi_index   — {lowercase_doi: note_stem}
         title_index — {normalised_title: note_stem}
-        date_index  — {note_stem: date_added_str}
     """
     doi_index: dict[str, str] = {}
     title_index: dict[str, str] = {}
-    date_index: dict[str, str] = {}
 
     for md_file in output_folder.glob("*.md"):
         stem = md_file.stem
         title_index[_normalise_title(stem)] = stem
         content = md_file.read_text(encoding="utf-8")
-
         m = _DOI_LINE_RE.search(content)
         if m:
             doi = m.group(1).strip().lower()
             if doi:
                 doi_index[doi] = stem
 
-        m = _DATE_ADDED_RE.search(content)
-        if m:
-            date_index[stem] = m.group(1)
-
     log.info("Library index: %d notes, %d with DOI", len(title_index), len(doi_index))
-    return doi_index, title_index, date_index
+    return doi_index, title_index
 
 
 # ---------------------------------------------------------------------------
-# S2 cache
+# Cache (reused across runs for incremental queries)
 # ---------------------------------------------------------------------------
 
 def load_cache() -> dict:
@@ -144,159 +141,129 @@ def save_cache(cache: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Semantic Scholar API calls
+# OpenAlex API calls
 # ---------------------------------------------------------------------------
 
-def _s2_headers(api_key: str) -> dict:
-    h = {"Accept": "application/json", "Content-Type": "application/json"}
-    if api_key:
-        h["x-api-key"] = api_key
-    return h
+def _oa_get(url: str, log: logging.Logger) -> dict | None:
+    """GET from OpenAlex with simple retry on transient errors."""
+    time.sleep(OPENALEX_SLEEP)
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": f"ObsidianWriter/1.0 (mailto:{OPENALEX_MAILTO})",
+    }
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        log.warning("OpenAlex HTTP %d for %s", e.code, url[:80])
+        return None
+    except Exception as exc:
+        log.warning("OpenAlex request error: %s", exc)
+        return None
 
 
-def _s2_request_with_backoff(
-    url: str,
-    data: bytes | None,
-    headers: dict,
-    log: logging.Logger,
-    max_attempts: int = 5,
-) -> dict | None:
-    """POST (or GET if data is None) with exponential backoff on 429."""
-    for attempt in range(max_attempts):
-        try:
-            req = urllib.request.Request(url, data=data, headers=headers,
-                                         method="POST" if data else "GET")
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                return json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as e:
-            if e.code == 429:
-                wait = min(60 * (2 ** attempt) + random.uniform(0, 1), 600)
-                log.warning("S2 rate limit (429). Waiting %.0f s (attempt %d/%d)...",
-                            wait, attempt + 1, max_attempts)
-                time.sleep(wait)
-                continue
-            log.warning("S2 HTTP error %d for %s", e.code, url[:80])
-            return None
-        except Exception as exc:
-            log.warning("S2 request error: %s", exc)
-            return None
-    log.warning("S2: max attempts exceeded for %s", url[:80])
-    return None
+def _strip_doi_prefix(doi_url: str) -> str:
+    """'https://doi.org/10.xxx/yyy' → '10.xxx/yyy' (lowercase)."""
+    if not doi_url:
+        return ""
+    doi = doi_url.lower()
+    for prefix in ("https://doi.org/", "http://doi.org/", "doi.org/"):
+        if doi.startswith(prefix):
+            return doi[len(prefix):]
+    return doi
 
 
-def batch_query_s2(dois: list[str], api_key: str, log: logging.Logger) -> dict:
-    """POST batch request to S2. Returns {doi_lower: {references, citations}}."""
+def _strip_oa_prefix(oa_id: str) -> str:
+    """'https://openalex.org/W123' → 'W123'."""
+    return oa_id.split("/")[-1] if oa_id else ""
+
+
+def batch_query_openalex(dois: list[str], log: logging.Logger) -> dict:
+    """Batch-fetch works from OpenAlex by DOI.
+
+    Returns {lowercase_doi: {oa_id, doi, title, referenced_work_ids}}.
+    Uses filter=doi:10.xxx|10.yyy — up to OPENALEX_BATCH_SIZE per request.
+    """
     results: dict[str, dict] = {}
-    fields = "title,externalIds,references.title,references.externalIds,citations.title,citations.externalIds"
 
-    for chunk_start in range(0, len(dois), S2_BATCH_SIZE):
-        chunk = dois[chunk_start: chunk_start + S2_BATCH_SIZE]
-        ids = [f"DOI:{doi}" for doi in chunk]
-        body = json.dumps({"ids": ids}).encode("utf-8")
-        url = f"{S2_BATCH_URL}?fields={fields}"
-        headers = _s2_headers(api_key)
+    for chunk_start in range(0, len(dois), OPENALEX_BATCH_SIZE):
+        chunk = dois[chunk_start: chunk_start + OPENALEX_BATCH_SIZE]
+        doi_filter = "|".join(chunk)
+        params = urllib.parse.urlencode({
+            "filter": f"doi:{doi_filter}",
+            "select": OPENALEX_SELECT,
+            "per_page": OPENALEX_BATCH_SIZE,
+            "mailto": OPENALEX_MAILTO,
+        })
+        url = f"{OPENALEX_BASE}?{params}"
 
-        log.info("S2 batch query: %d DOIs (offset %d)...", len(chunk), chunk_start)
-        response = _s2_request_with_backoff(url, body, headers, log)
-        if response is None:
-            log.warning("S2 batch failed for chunk at offset %d — skipping", chunk_start)
+        log.info("OpenAlex batch query: %d DOIs (offset %d)...", len(chunk), chunk_start)
+        data = _oa_get(url, log)
+        if not data:
+            log.warning("OpenAlex: no response for chunk at offset %d", chunk_start)
             continue
 
-        # Response is a list parallel to ids
-        if not isinstance(response, list):
-            log.warning("S2 batch: unexpected response type %s", type(response))
-            continue
-
-        for doi, item in zip(chunk, response):
-            if item is None:
-                log.debug("S2: no result for DOI %s", doi)
+        for work in data.get("results", []):
+            raw_doi = work.get("doi", "")
+            doi = _strip_doi_prefix(raw_doi)
+            if not doi:
                 continue
-            results[doi.lower()] = item
+            oa_id = _strip_oa_prefix(work.get("id", ""))
+            ref_ids = [_strip_oa_prefix(r) for r in (work.get("referenced_works") or [])]
+            results[doi] = {
+                "oa_id": oa_id,
+                "doi": doi,
+                "title": work.get("title") or "",
+                "referenced_work_ids": ref_ids,
+            }
 
-        # Brief pause between batch chunks
-        if chunk_start + S2_BATCH_SIZE < len(dois):
-            time.sleep(1)
+        log.debug("OpenAlex: got %d results for chunk (cumulative: %d)",
+                  len(data.get("results", [])), len(results))
 
     return results
 
 
-def search_s2_by_title(
-    title: str,
-    api_key: str,
-    sleep_seconds: float,
-    log: logging.Logger,
-) -> dict | None:
-    """Fallback: search S2 by title for papers without DOI."""
-    import urllib.parse
-    params = urllib.parse.urlencode({"query": title, "limit": 3,
-                                    "fields": "title,externalIds,references.title,references.externalIds,citations.title,citations.externalIds"})
-    url = f"{S2_SEARCH_URL}?{params}"
-    headers = _s2_headers(api_key)
-    headers.pop("Content-Type", None)
-
-    time.sleep(sleep_seconds)
-    response = _s2_request_with_backoff(url, None, headers, log)
-    if not response:
+def search_openalex_by_title(title: str, log: logging.Logger) -> dict | None:
+    """Fallback: search OpenAlex by title for papers without DOI."""
+    params = urllib.parse.urlencode({
+        "search": title,
+        "select": OPENALEX_SELECT,
+        "per_page": 3,
+        "mailto": OPENALEX_MAILTO,
+    })
+    url = f"{OPENALEX_BASE}?{params}"
+    data = _oa_get(url, log)
+    if not data:
         return None
 
-    items = response.get("data", [])
-    if not items:
+    results = data.get("results", [])
+    if not results:
         return None
 
     norm_q = _normalise_title(title)
     best_ratio = 0.0
-    best_item = None
-    for item in items:
-        s2_title = item.get("title") or ""
-        ratio = difflib.SequenceMatcher(None, norm_q, _normalise_title(s2_title)).ratio()
+    best_work = None
+    for work in results:
+        oa_title = work.get("title") or ""
+        ratio = difflib.SequenceMatcher(None, norm_q, _normalise_title(oa_title)).ratio()
         if ratio > best_ratio:
             best_ratio = ratio
-            best_item = item
+            best_work = work
 
-    if best_ratio >= 0.85:
-        log.debug("S2 title match: ratio=%.2f  %r", best_ratio, title[:60])
-        return best_item
+    if best_ratio >= 0.85 and best_work:
+        oa_id = _strip_oa_prefix(best_work.get("id", ""))
+        ref_ids = [_strip_oa_prefix(r) for r in (best_work.get("referenced_works") or [])]
+        log.debug("OpenAlex title match: ratio=%.2f  %r", best_ratio, title[:60])
+        return {
+            "oa_id": oa_id,
+            "doi": _strip_doi_prefix(best_work.get("doi", "")),
+            "title": best_work.get("title") or "",
+            "referenced_work_ids": ref_ids,
+        }
 
-    log.debug("S2 title search: best ratio %.2f below threshold for %r", best_ratio, title[:60])
-    return None
-
-
-# ---------------------------------------------------------------------------
-# Match S2 paper against library
-# ---------------------------------------------------------------------------
-
-def _doi_from_s2_paper(paper: dict) -> str | None:
-    ext = paper.get("externalIds") or {}
-    doi = ext.get("DOI", "")
-    return doi.lower() if doi else None
-
-
-def match_s2_paper_to_library(
-    paper: dict,
-    doi_index: dict,
-    title_index: dict,
-) -> str | None:
-    """Return the note_stem if this S2 paper matches a library note, else None."""
-    doi = _doi_from_s2_paper(paper)
-    if doi and doi in doi_index:
-        return doi_index[doi]
-
-    s2_title = paper.get("title") or ""
-    if s2_title:
-        norm = _normalise_title(s2_title)
-        if norm in title_index:
-            return title_index[norm]
-        # Fuzzy fallback (cheaper than full scan — only try if no exact match)
-        best_ratio = 0.0
-        best_stem = None
-        for lib_norm, stem in title_index.items():
-            ratio = difflib.SequenceMatcher(None, norm, lib_norm).ratio()
-            if ratio > best_ratio:
-                best_ratio = ratio
-                best_stem = stem
-        if best_ratio >= 0.85:
-            return best_stem
-
+    log.debug("OpenAlex title search: best ratio %.2f below threshold for %r",
+              best_ratio, title[:60])
     return None
 
 
@@ -311,13 +278,9 @@ AUTO_SUFFIX = " <!--auto-->"
 
 
 def _parse_related_section(content: str) -> tuple[list[str], list[str], int, int]:
-    """Parse Related Papers section from note content.
+    """Parse Related Papers section.
 
-    Returns:
-        user_links  — list of note_stems written by hand (no <!--auto-->)
-        auto_links  — list of note_stems with <!--auto-->
-        section_start — character offset of start of Related Papers block
-        section_end   — character offset of end of Related Papers block
+    Returns: (user_links, auto_links, section_start, section_end)
     """
     m = _RELATED_SECTION_RE.search(content)
     if not m:
@@ -325,25 +288,18 @@ def _parse_related_section(content: str) -> tuple[list[str], list[str], int, int
 
     section_start = m.start()
     body_start = m.end()
-
-    # Find next ## heading after Related Papers
     rest = content[body_start:]
     next_m = _NEXT_SECTION_RE.search(rest)
-    if next_m:
-        body_end = body_start + next_m.start()
-    else:
-        body_end = len(content)
-
+    body_end = body_start + next_m.start() if next_m else len(content)
     body = content[body_start:body_end]
 
     user_links: list[str] = []
     auto_links: list[str] = []
-
     for line in body.splitlines():
-        wikilink_m = re.search(r'\[\[([^\]]+)\]\]', line)
-        if not wikilink_m:
+        wl = re.search(r'\[\[([^\]]+)\]\]', line)
+        if not wl:
             continue
-        stem = wikilink_m.group(1)
+        stem = wl.group(1)
         if AUTO_SUFFIX in line:
             auto_links.append(stem)
         else:
@@ -353,7 +309,6 @@ def _parse_related_section(content: str) -> tuple[list[str], list[str], int, int
 
 
 def _build_related_section(user_links: list[str], auto_links: list[str]) -> str:
-    """Build the ## Related Papers section text."""
     lines = ["## Related Papers", ""]
     if not user_links and not auto_links:
         lines.append("- ")
@@ -381,7 +336,7 @@ def update_note_related_papers(
     output_folder: Path,
     log: logging.Logger,
 ) -> bool:
-    """Update Related Papers section of a note. Returns True if file was written."""
+    """Update Related Papers section. Returns True if file was written."""
     content = filepath.read_text(encoding="utf-8")
     user_links, current_auto, section_start, section_end = _parse_related_section(content)
 
@@ -389,14 +344,11 @@ def update_note_related_papers(
         log.warning("No '## Related Papers' section in %s — skipping", filepath.name)
         return False
 
-    current_auto_set = set(current_auto)
-    if current_auto_set == new_auto_links:
+    if set(current_auto) == new_auto_links:
         log.debug("No change to auto-links for %s", filepath.stem[:60])
         return False
 
     new_section = _build_related_section(user_links, sorted(new_auto_links))
-
-    # Reconstruct content: everything before section + new section + everything after
     new_content = content[:section_start] + new_section + content[section_end:]
 
     backup_note(filepath, output_folder, log)
@@ -410,7 +362,7 @@ def update_note_related_papers(
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Step 3 — Citation linking")
+    parser = argparse.ArgumentParser(description="Step 3 — Citation linking via OpenAlex")
     parser.add_argument("--full", action="store_true", help="Re-query all papers (ignore cache)")
     parser.add_argument("--verbose", action="store_true", help="Show debug output on console")
     args = parser.parse_args()
@@ -423,54 +375,65 @@ def main() -> None:
         log.error("output_folder does not exist: %s", output_folder)
         sys.exit(1)
 
-    api_key = config.get("semantic_scholar_api_key", "")
-    sleep_seconds = float(config.get("s2_sleep_seconds", 1.0))
-
     # --- Build library index ---
-    doi_index, title_index, date_index = build_library_index(output_folder, log)
+    doi_index, title_index = build_library_index(output_folder, log)
 
     # --- Load cache ---
     cache = {} if args.full else load_cache()
 
     # --- Determine what to query ---
-    # dois_to_query: {doi: note_stem}
-    dois_to_query: dict[str, str] = {}
-    no_doi_stems: list[str] = []   # stems without DOI for title-search fallback
+    dois_to_query: list[str] = []
+    no_doi_stems: list[str] = []
+    doi_stems = set(doi_index.values())
 
-    for doi, stem in doi_index.items():
-        if not args.full and doi in cache:
-            log.debug("Cache hit for DOI %s (%s)", doi, stem[:40])
+    for doi in doi_index:
+        if args.full or doi not in cache:
+            dois_to_query.append(doi)
         else:
-            dois_to_query[doi] = stem
+            log.debug("Cache hit: %s", doi)
 
-    for norm_title, stem in title_index.items():
-        if stem not in {s for s in doi_index.values()}:
+    for norm, stem in title_index.items():
+        if stem not in doi_stems:
             no_doi_stems.append(stem)
 
     log.info("To query: %d DOI papers, %d no-DOI papers (title fallback)",
              len(dois_to_query), len(no_doi_stems))
 
-    # --- Batch query S2 for DOI papers ---
-    # s2_results: {doi: s2_item}
-    s2_results: dict[str, dict] = {}
+    # --- Batch query OpenAlex for DOI papers ---
+    # oa_results: {doi: {oa_id, referenced_work_ids, ...}}
+    oa_results: dict[str, dict] = {}
     if dois_to_query:
-        batch = list(dois_to_query.keys())
-        s2_results = batch_query_s2(batch, api_key, log)
+        oa_results = batch_query_openalex(dois_to_query, log)
         now_iso = datetime.now().isoformat()
-        for doi in batch:
+        for doi in dois_to_query:
             cache[doi] = now_iso
         save_cache(cache)
+        log.info("OpenAlex returned data for %d / %d queried DOIs",
+                 len(oa_results), len(dois_to_query))
 
     # --- Per-paper fallback for no-DOI papers ---
-    no_doi_results: dict[str, dict] = {}  # stem: s2_item
+    no_doi_results: dict[str, dict] = {}
     for stem in no_doi_stems:
-        result = search_s2_by_title(stem, api_key, sleep_seconds, log)
+        result = search_openalex_by_title(stem, log)
         if result:
             no_doi_results[stem] = result
         else:
-            log.debug("S2: no result for no-DOI paper %r", stem[:60])
+            log.debug("OpenAlex: no result for %r", stem[:60])
 
-    # --- Build bidirectional link map: {note_stem: set of linked stems} ---
+    # --- Build OpenAlex ID → note_stem reverse index ---
+    # This lets us match referenced_work_ids back to library notes.
+    oa_id_to_stem: dict[str, str] = {}
+    for doi, work in oa_results.items():
+        oa_id = work.get("oa_id", "")
+        stem = doi_index.get(doi)
+        if oa_id and stem:
+            oa_id_to_stem[oa_id] = stem
+    for stem, work in no_doi_results.items():
+        oa_id = work.get("oa_id", "")
+        if oa_id:
+            oa_id_to_stem[oa_id] = stem
+
+    # --- Build bidirectional link map ---
     links: dict[str, set[str]] = {stem: set() for stem in title_index.values()}
 
     def _register_link(source_stem: str, target_stem: str) -> None:
@@ -481,26 +444,23 @@ def main() -> None:
         if target_stem in links:
             links[target_stem].add(source_stem)
 
-    # Process DOI query results
-    for doi, item in s2_results.items():
+    for doi, work in oa_results.items():
         source_stem = doi_index.get(doi)
         if not source_stem:
             continue
-        for rel_paper in (item.get("references") or []) + (item.get("citations") or []):
-            if not rel_paper:
-                continue
-            target_stem = match_s2_paper_to_library(rel_paper, doi_index, title_index)
+        for ref_id in work.get("referenced_work_ids", []):
+            target_stem = oa_id_to_stem.get(ref_id)
             if target_stem:
                 _register_link(source_stem, target_stem)
 
-    # Process no-DOI results
-    for source_stem, item in no_doi_results.items():
-        for rel_paper in (item.get("references") or []) + (item.get("citations") or []):
-            if not rel_paper:
-                continue
-            target_stem = match_s2_paper_to_library(rel_paper, doi_index, title_index)
+    for source_stem, work in no_doi_results.items():
+        for ref_id in work.get("referenced_work_ids", []):
+            target_stem = oa_id_to_stem.get(ref_id)
             if target_stem:
                 _register_link(source_stem, target_stem)
+
+    total_links = sum(len(v) for v in links.values())
+    log.info("Total bidirectional links found: %d", total_links)
 
     # --- Update notes ---
     updated = 0
@@ -521,6 +481,7 @@ def main() -> None:
     print("  Step 3 done.")
     print(f"  Notes updated:   {updated:4}")
     print(f"  Notes unchanged: {unchanged:4}")
+    print(f"  Links found:     {total_links:4}")
     print("=" * 50)
 
 
