@@ -376,7 +376,6 @@ def render_note(data, pdf_path, year, doi):
     parts.append("")
     parts.append("## Tags")
     parts.append("")
-    parts.append("")
     if tags_str:
         parts.append(tags_str)
 

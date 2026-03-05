@@ -3,5 +3,17 @@
   "zotero_api_key": "YOUR_API_KEY",
   "zotero_library_type": "user",
   "zotero_storage_path": "/home/YOUR_USERNAME/Zotero/storage",
-  "output_folder": "/home/YOUR_USERNAME/Documents/Obsidian Vault/Papers/"
+  "output_folder": "/home/YOUR_USERNAME/Documents/Obsidian Vault/Papers/",
+
+  "_comment_step1": "Step 1 — Zotero cleanup (paths to Zotero-sweep output)",
+  "harvest_progress_path": "/home/YOUR_USERNAME/Git Projects/Zotero-sweep/harvest_progress.md",
+  "zotero_sweep_log": "/home/YOUR_USERNAME/Git Projects/Zotero-sweep/logs/zotero_sweep.log",
+
+  "_comment_step3": "Step 3 — Citation linking via Semantic Scholar (leave api_key blank for anonymous access)",
+  "semantic_scholar_api_key": "",
+  "s2_sleep_seconds": 1.0,
+
+  "_comment_step4": "Step 4 — Key points generation via Claude API",
+  "anthropic_api_key": "YOUR_ANTHROPIC_API_KEY",
+  "claude_model": "claude-haiku-4-5-20251001"
 }
