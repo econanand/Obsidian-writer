@@ -1,8 +1,12 @@
 """
 Step 4 — Key Points Generation
 
-For each note where the Key Points section is empty AND the paper has an
-abstract in Zotero, calls the Claude API to generate 3-5 concise bullet points.
+For each note where the Key Points section is empty, calls the Claude API to
+generate 3-5 concise bullet points. Abstract source priority:
+  1. Zotero abstractNote field
+  2. OpenAlex (fetched by DOI from the note) — fallback when Zotero has none
+
+Notes without an abstract in either source are skipped.
 
 Usage:
     python step4_key_points.py [--dry-run] [--verbose]
@@ -11,7 +15,6 @@ Usage:
     --verbose   Show debug output on console
 
 Backs up each note before writing to {output_folder}/.backup/
-Papers without abstracts in Zotero are silently skipped (logged at INFO).
 Notes that already have user-written Key Points are never touched.
 """
 
@@ -21,6 +24,9 @@ import logging
 import re
 import shutil
 import sys
+import time
+import urllib.error
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 
@@ -41,6 +47,10 @@ STEP4_REQUIRED_KEYS = [
 ]
 
 DEFAULT_MODEL = "claude-haiku-4-5-20251001"
+
+OPENALEX_BASE = "https://api.openalex.org/works"
+OPENALEX_MAILTO = "anand.guitarist@gmail.com"
+OPENALEX_SLEEP = 0.15
 
 
 def setup_logging(verbose: bool = False) -> logging.Logger:
@@ -94,6 +104,58 @@ def connect_claude(config: dict, log: logging.Logger):
         log.error("anthropic is not installed. Run: pip install anthropic")
         sys.exit(1)
     return anthropic.Anthropic(api_key=config["anthropic_api_key"])
+
+
+# ---------------------------------------------------------------------------
+# OpenAlex abstract fallback
+# ---------------------------------------------------------------------------
+
+_DOI_LINE_RE = re.compile(r'\*\*DOI\*\*:.*\[([^\]]+)\]')
+
+
+def _reconstruct_abstract(inverted_index: dict) -> str:
+    """Reconstruct plain text from OpenAlex abstract_inverted_index format.
+
+    The inverted index maps {word: [position, ...]}. We reverse it to get
+    ordered words, then join them.
+    """
+    if not inverted_index:
+        return ""
+    positions: list[tuple[int, str]] = []
+    for word, pos_list in inverted_index.items():
+        for pos in pos_list:
+            positions.append((pos, word))
+    positions.sort()
+    return " ".join(word for _, word in positions)
+
+
+def fetch_abstract_from_openalex(doi: str, log: logging.Logger) -> str | None:
+    """Fetch abstract from OpenAlex by DOI. Returns plain text or None."""
+    import urllib.parse
+    encoded_doi = urllib.parse.quote(f"https://doi.org/{doi}", safe=":/.")
+    url = (f"{OPENALEX_BASE}/{encoded_doi}"
+           f"?select=abstract_inverted_index&mailto={OPENALEX_MAILTO}")
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": f"ObsidianWriter/1.0 (mailto:{OPENALEX_MAILTO})",
+    }
+    time.sleep(OPENALEX_SLEEP)
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            log.debug("OpenAlex: no record for DOI %s", doi)
+        else:
+            log.warning("OpenAlex HTTP %d for DOI %s", e.code, doi)
+        return None
+    except Exception as exc:
+        log.warning("OpenAlex request error for DOI %s: %s", doi, exc)
+        return None
+
+    abstract = _reconstruct_abstract(data.get("abstract_inverted_index") or {})
+    return abstract if abstract else None
 
 
 # ---------------------------------------------------------------------------
@@ -233,12 +295,11 @@ def backup_note(filepath: Path, output_folder: Path, log: logging.Logger) -> Non
 # Claude prompt and API call
 # ---------------------------------------------------------------------------
 
-def _build_prompt(data: dict, research_context: str, cites: list[str], cited_by: list[str]) -> str:
+def _build_prompt(data: dict, abstract: str, research_context: str, cites: list[str], cited_by: list[str]) -> str:
     title = data.get("title", "Unknown")
     year = data.get("date", "")[:4] or "?"
     journal = data.get("publicationTitle", "") or data.get("bookTitle", "") or ""
     authors = _format_authors(data.get("creators", []))
-    abstract = data.get("abstractNote", "").strip()
 
     cites_str = "\n".join(f"  - {t}" for t in cites) if cites else "  none identified"
     cited_by_str = "\n".join(f"  - {t}" for t in cited_by) if cited_by else "  none identified"
@@ -264,6 +325,7 @@ Write exactly 3-5 bullet points summarizing the key contributions and findings o
 def generate_key_points(
     client,
     data: dict,
+    abstract: str,
     research_context: str,
     model: str,
     log: logging.Logger,
@@ -271,7 +333,7 @@ def generate_key_points(
     cited_by: list[str] | None = None,
 ) -> str | None:
     """Call Claude and return key points text (the bullet lines), or None on error."""
-    prompt = _build_prompt(data, research_context, cites or [], cited_by or [])
+    prompt = _build_prompt(data, abstract, research_context, cites or [], cited_by or [])
 
     try:
         response = client.messages.create(
@@ -377,7 +439,8 @@ def main() -> None:
     research_context = build_research_context(items_by_title)
 
     # --- Find eligible notes ---
-    eligible: list[Path] = []
+    # eligible entries: (md_file, data, abstract, abstract_source)
+    eligible: list[tuple[Path, dict, str, str]] = []
     skipped_no_abstract = 0
     skipped_has_content = 0
 
@@ -395,23 +458,40 @@ def main() -> None:
             log.debug("No Zotero match for note %r — skipping", md_file.stem[:60])
             continue
 
+        # Abstract source 1: Zotero
         abstract = data.get("abstractNote", "").strip()
+        abstract_source = "Zotero"
+
+        # Abstract source 2: OpenAlex fallback
         if not abstract:
-            log.info("Skipping %r: no abstract in Zotero", md_file.stem[:60])
+            doi_m = _DOI_LINE_RE.search(content)
+            if doi_m:
+                doi = doi_m.group(1).strip().lower()
+                log.info("No Zotero abstract for %r — trying OpenAlex...", md_file.stem[:50])
+                abstract = fetch_abstract_from_openalex(doi, log) or ""
+                if abstract:
+                    abstract_source = "OpenAlex"
+
+        if not abstract:
+            log.info("Skipping %r: no abstract in Zotero or OpenAlex", md_file.stem[:60])
             skipped_no_abstract += 1
             continue
 
-        eligible.append(md_file)
+        eligible.append((md_file, data, abstract, abstract_source))
 
-    log.info("Eligible notes: %d  (no abstract: %d, already has content: %d)",
-             len(eligible), skipped_no_abstract, skipped_has_content)
+    from_zotero = sum(1 for _, _, _, src in eligible if src == "Zotero")
+    from_openalex = sum(1 for _, _, _, src in eligible if src == "OpenAlex")
+    log.info("Eligible: %d  (Zotero abstract: %d, OpenAlex abstract: %d, no abstract: %d, has content: %d)",
+             len(eligible), from_zotero, from_openalex, skipped_no_abstract, skipped_has_content)
 
     if args.dry_run:
         print()
         print(f"DRY RUN — {len(eligible)} note(s) would be updated:")
-        for f in eligible:
-            print(f"  - {f.stem[:70]}")
+        for md_file, _, _, src in eligible:
+            print(f"  - {md_file.stem[:65]}  [{src}]")
         print()
+        print(f"  Abstract from Zotero:     {from_zotero}")
+        print(f"  Abstract from OpenAlex:   {from_openalex}")
         print(f"  Skipped (no abstract):    {skipped_no_abstract}")
         print(f"  Skipped (has content):    {skipped_has_content}")
         return
@@ -420,14 +500,11 @@ def main() -> None:
     generated = 0
     failed = 0
 
-    for md_file in eligible:
-        norm = _normalise_title(md_file.stem)
-        data = items_by_title[norm]
-
+    for md_file, data, abstract, abstract_source in eligible:
         content = md_file.read_text(encoding="utf-8")
         cites, cited_by = _extract_related_papers(content)
 
-        key_points = generate_key_points(client, data, research_context, model, log,
+        key_points = generate_key_points(client, data, abstract, research_context, model, log,
                                          cites=cites, cited_by=cited_by)
         if key_points is None:
             log.error("Failed to generate key points for %r", md_file.stem[:60])
@@ -436,6 +513,7 @@ def main() -> None:
 
         wrote = update_note_key_points(md_file, key_points, output_folder, log)
         if wrote:
+            log.info("  [%s abstract]", abstract_source)
             generated += 1
         else:
             failed += 1
