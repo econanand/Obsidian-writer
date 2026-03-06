@@ -11,7 +11,7 @@ Usage:
 Keys during review:
     d — delete this item from Zotero
     k — keep this item (skip)
-    u — look up correct metadata on OpenAlex and update Zotero
+    u — update Zotero item (from OpenAlex or from the PDF itself)
     s — skip the rest of this session
 
 Before any deletion the full item JSON is appended to cleanup_deletions.log —
@@ -400,6 +400,45 @@ def update_item_metadata(zot, item: dict, metadata: dict, log: logging.Logger) -
         return False
 
 
+def update_item_from_pdf(zot, item: dict, pdf_snippet: dict, log: logging.Logger) -> bool:
+    """Patch Zotero item title and abstractNote from PDF-extracted text.
+
+    Title is always overwritten; abstractNote is only filled if currently empty.
+    Returns True if any changes were written.
+    """
+    key = item["key"]
+    try:
+        fresh = zot.item(key)
+    except Exception as exc:
+        log.error("Failed to re-fetch item %s for update: %s", key, exc)
+        return False
+
+    data = fresh["data"]
+    changes: list[str] = []
+
+    pdf_title = (pdf_snippet.get("title") or "").strip()
+    pdf_abstract = (pdf_snippet.get("abstract") or "").strip()
+
+    if pdf_title:
+        data["title"] = pdf_title
+        changes.append("title")
+    if pdf_abstract and not data.get("abstractNote", "").strip():
+        data["abstractNote"] = pdf_abstract
+        changes.append("abstractNote")
+
+    if not changes:
+        log.info("No new fields to update from PDF for item %s", key)
+        return False
+
+    try:
+        zot.update_item(fresh)
+        log.info("Updated item %s from PDF — changed: %s", key, changes)
+        return True
+    except Exception as exc:
+        log.error("Failed to update item %s: %s", key, exc)
+        return False
+
+
 def match_title(candidate: str, zotero_items: list[dict], threshold: float) -> list[dict]:
     """Return Zotero items whose title fuzzy-matches candidate at >= threshold."""
     norm_candidate = _normalise_title(candidate)
@@ -536,31 +575,58 @@ def review_candidates(
                 kept += 1
                 break
             elif choice == "u":
-                search_title = (pdf_snippet.get("title") or "") if pdf_snippet else ""
-                if not search_title:
-                    search_title = data.get("title", "")
-                print(f"  Searching OpenAlex for: {search_title[:70]!r} ...")
-                metadata = _oa_search_for_metadata(search_title, log)
-                if not metadata:
-                    print("  No OpenAlex match found (ratio below 0.75 or network error).")
+                pdf_has_content = bool(pdf_snippet and (pdf_snippet.get("title") or pdf_snippet.get("abstract")))
+
+                # Decide source: if PDF content is available, ask; otherwise go straight to OpenAlex
+                if pdf_has_content:
+                    try:
+                        src = input("  Update from: [o]penAlex / [p]df: ").strip().lower()
+                    except (EOFError, KeyboardInterrupt):
+                        print("\nAborted.")
+                        return deleted, kept
                 else:
-                    print(f"  OpenAlex match (ratio {metadata['match_ratio']:.2f}):")
-                    print(f"    Title:   {metadata['title'][:70]}")
-                    print(f"    Authors: {', '.join(metadata['authors'][:3])}")
-                    print(f"    Year:    {metadata['year']}")
-                    print(f"    Journal: {metadata['journal'][:60]}")
-                    print(f"    DOI:     {metadata['doi'] or '(none)'}")
+                    src = "o"
+
+                if src == "p":
+                    print(f"  PDF title:    {(pdf_snippet.get('title') or '(none)')[:70]}")
+                    print(f"  PDF abstract: {(pdf_snippet.get('abstract') or '(none)')[:120]}…")
                     try:
                         confirm = input("  Apply these changes to Zotero? [y/n]: ").strip().lower()
                     except (EOFError, KeyboardInterrupt):
                         print("\nAborted.")
                         return deleted, kept
                     if confirm == "y":
-                        updated = update_item_metadata(zot, item, metadata, log)
+                        updated = update_item_from_pdf(zot, item, pdf_snippet, log)
                         if updated:
-                            print("  → Zotero item updated.")
+                            print("  → Zotero item updated from PDF.")
                         else:
                             print("  → No changes applied (fields already filled or error).")
+                else:
+                    search_title = (pdf_snippet.get("title") or "") if pdf_snippet else ""
+                    if not search_title:
+                        search_title = data.get("title", "")
+                    print(f"  Searching OpenAlex for: {search_title[:70]!r} ...")
+                    metadata = _oa_search_for_metadata(search_title, log)
+                    if not metadata:
+                        print("  No OpenAlex match found (ratio below 0.75 or network error).")
+                    else:
+                        print(f"  OpenAlex match (ratio {metadata['match_ratio']:.2f}):")
+                        print(f"    Title:   {metadata['title'][:70]}")
+                        print(f"    Authors: {', '.join(metadata['authors'][:3])}")
+                        print(f"    Year:    {metadata['year']}")
+                        print(f"    Journal: {metadata['journal'][:60]}")
+                        print(f"    DOI:     {metadata['doi'] or '(none)'}")
+                        try:
+                            confirm = input("  Apply these changes to Zotero? [y/n]: ").strip().lower()
+                        except (EOFError, KeyboardInterrupt):
+                            print("\nAborted.")
+                            return deleted, kept
+                        if confirm == "y":
+                            updated = update_item_metadata(zot, item, metadata, log)
+                            if updated:
+                                print("  → Zotero item updated from OpenAlex.")
+                            else:
+                                print("  → No changes applied (fields already filled or error).")
                 # loop back so user can still d/k/s this item
             elif choice == "s":
                 print("Stopping review.")
