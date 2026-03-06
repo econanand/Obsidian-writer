@@ -11,6 +11,7 @@ Usage:
 Keys during review:
     d — delete this item from Zotero
     k — keep this item (skip)
+    u — look up correct metadata on OpenAlex and update Zotero
     s — skip the rest of this session
 
 Before any deletion the full item JSON is appended to cleanup_deletions.log —
@@ -23,6 +24,10 @@ import json
 import logging
 import re
 import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 
@@ -266,6 +271,135 @@ def extract_pdf_snippet(pdf_path, log: logging.Logger) -> dict:
     return result
 
 
+OPENALEX_BASE = "https://api.openalex.org/works"
+OPENALEX_MAILTO = "anand.guitarist@gmail.com"
+OPENALEX_SLEEP = 0.15
+
+
+def _oa_search_for_metadata(title: str, log: logging.Logger) -> dict | None:
+    """Search OpenAlex by title; return parsed metadata dict or None.
+
+    Requires similarity >= 0.75 between query and best result title.
+    """
+    params = urllib.parse.urlencode({
+        "search": title,
+        "select": "id,title,doi,authorships,publication_year,primary_location,biblio",
+        "per_page": 3,
+        "mailto": OPENALEX_MAILTO,
+    })
+    url = f"{OPENALEX_BASE}?{params}"
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": f"ObsidianWriter/1.0 (mailto:{OPENALEX_MAILTO})",
+    }
+    time.sleep(OPENALEX_SLEEP)
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:
+        log.warning("OpenAlex search error: %s", exc)
+        return None
+
+    results = data.get("results", [])
+    if not results:
+        return None
+
+    norm_q = _normalise_title(title)
+    best_ratio = 0.0
+    best_work = None
+    for work in results:
+        oa_title = work.get("title") or ""
+        ratio = difflib.SequenceMatcher(None, norm_q, _normalise_title(oa_title)).ratio()
+        if ratio > best_ratio:
+            best_ratio = ratio
+            best_work = work
+
+    if best_ratio < 0.75 or best_work is None:
+        log.debug("OpenAlex: best ratio %.2f below threshold for %r", best_ratio, title[:60])
+        return None
+
+    doi = (best_work.get("doi") or "").replace("https://doi.org/", "")
+    authors = [
+        (a.get("author") or {}).get("display_name", "")
+        for a in (best_work.get("authorships") or [])
+        if (a.get("author") or {}).get("display_name")
+    ]
+    year = str(best_work.get("publication_year") or "")
+    journal = ((best_work.get("primary_location") or {})
+               .get("source") or {}).get("display_name", "") or ""
+    biblio = best_work.get("biblio") or {}
+    first_page = biblio.get("first_page") or ""
+    last_page = biblio.get("last_page") or ""
+    pages = f"{first_page}-{last_page}" if first_page and last_page else first_page
+
+    return {
+        "title": best_work.get("title") or "",
+        "doi": doi,
+        "authors": authors,
+        "year": year,
+        "journal": journal,
+        "volume": biblio.get("volume") or "",
+        "issue": biblio.get("issue") or "",
+        "pages": pages,
+        "match_ratio": best_ratio,
+    }
+
+
+def update_item_metadata(zot, item: dict, metadata: dict, log: logging.Logger) -> bool:
+    """Patch Zotero item with OpenAlex metadata. Returns True on success.
+
+    Only fills fields that are currently empty in Zotero (except title,
+    which is always updated when it differs).
+    """
+    key = item["key"]
+    try:
+        fresh = zot.item(key)
+    except Exception as exc:
+        log.error("Failed to re-fetch item %s for update: %s", key, exc)
+        return False
+
+    data = fresh["data"]
+    changes: list[str] = []
+
+    def _set(field: str, value: str, overwrite: bool = False) -> None:
+        if value and (overwrite or not data.get(field, "").strip()):
+            data[field] = value
+            changes.append(field)
+
+    _set("title", metadata.get("title", ""), overwrite=True)
+    _set("DOI", metadata.get("doi", ""))
+    _set("date", metadata.get("year", ""))
+    _set("publicationTitle", metadata.get("journal", ""))
+    _set("volume", metadata.get("volume", ""))
+    _set("issue", metadata.get("issue", ""))
+    _set("pages", metadata.get("pages", ""))
+
+    if metadata.get("authors") and not data.get("creators"):
+        creators = []
+        for name in metadata["authors"]:
+            parts = name.rsplit(" ", 1)
+            if len(parts) == 2:
+                creators.append({"creatorType": "author",
+                                  "firstName": parts[0], "lastName": parts[1]})
+            else:
+                creators.append({"creatorType": "author", "name": name})
+        data["creators"] = creators
+        changes.append("creators")
+
+    if not changes:
+        log.info("No new fields to update for item %s", key)
+        return False
+
+    try:
+        zot.update_item(fresh)
+        log.info("Updated item %s — changed: %s", key, changes)
+        return True
+    except Exception as exc:
+        log.error("Failed to update item %s: %s", key, exc)
+        return False
+
+
 def match_title(candidate: str, zotero_items: list[dict], threshold: float) -> list[dict]:
     """Return Zotero items whose title fuzzy-matches candidate at >= threshold."""
     norm_candidate = _normalise_title(candidate)
@@ -382,7 +516,7 @@ def review_candidates(
 
         while True:
             try:
-                choice = input("  Action — [d]elete / [k]eep / [s]top: ").strip().lower()
+                choice = input("  Action — [d]elete / [k]eep / [u]pdate via OpenAlex / [s]top: ").strip().lower()
             except (EOFError, KeyboardInterrupt):
                 print("\nAborted.")
                 return deleted, kept
@@ -401,11 +535,38 @@ def review_candidates(
                 print(f"  → Kept: {title[:60]}")
                 kept += 1
                 break
+            elif choice == "u":
+                search_title = (pdf_snippet.get("title") or "") if pdf_snippet else ""
+                if not search_title:
+                    search_title = data.get("title", "")
+                print(f"  Searching OpenAlex for: {search_title[:70]!r} ...")
+                metadata = _oa_search_for_metadata(search_title, log)
+                if not metadata:
+                    print("  No OpenAlex match found (ratio below 0.75 or network error).")
+                else:
+                    print(f"  OpenAlex match (ratio {metadata['match_ratio']:.2f}):")
+                    print(f"    Title:   {metadata['title'][:70]}")
+                    print(f"    Authors: {', '.join(metadata['authors'][:3])}")
+                    print(f"    Year:    {metadata['year']}")
+                    print(f"    Journal: {metadata['journal'][:60]}")
+                    print(f"    DOI:     {metadata['doi'] or '(none)'}")
+                    try:
+                        confirm = input("  Apply these changes to Zotero? [y/n]: ").strip().lower()
+                    except (EOFError, KeyboardInterrupt):
+                        print("\nAborted.")
+                        return deleted, kept
+                    if confirm == "y":
+                        updated = update_item_metadata(zot, item, metadata, log)
+                        if updated:
+                            print("  → Zotero item updated.")
+                        else:
+                            print("  → No changes applied (fields already filled or error).")
+                # loop back so user can still d/k/s this item
             elif choice == "s":
                 print("Stopping review.")
                 return deleted, kept
             else:
-                print("  Please type d, k, or s.")
+                print("  Please type d, k, u, or s.")
 
     return deleted, kept
 
