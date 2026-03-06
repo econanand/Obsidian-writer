@@ -161,20 +161,109 @@ def parse_harvest_progress(filepath: Path, log: logging.Logger) -> tuple[list[st
 # Matching against Zotero library
 # ---------------------------------------------------------------------------
 
-def fetch_zotero_items(zot, log: logging.Logger) -> list[dict]:
-    """Fetch all non-attachment, non-note items from Zotero."""
+def fetch_zotero_items(zot, log: logging.Logger) -> tuple[list[dict], dict]:
+    """Fetch all content items and build attachment map.
+
+    Returns:
+        items               — list of non-attachment, non-note item dicts
+        parent_attachments  — {parent_key: [attachment data dicts]}
+    """
     log.info("Fetching all items from Zotero...")
     try:
         all_items = zot.everything(zot.items())
     except Exception as exc:
         log.error("Failed to fetch items from Zotero: %s", exc)
         sys.exit(1)
-    items = [
-        item for item in all_items
-        if item.get("data", {}).get("itemType", "") not in ("attachment", "note")
-    ]
+
+    items = []
+    parent_attachments: dict[str, list[dict]] = {}
+
+    for item in all_items:
+        data = item.get("data", {})
+        item_type = data.get("itemType", "")
+        if item_type == "attachment":
+            parent_key = data.get("parentItem")
+            if parent_key:
+                parent_attachments.setdefault(parent_key, []).append(data)
+        elif item_type != "note":
+            items.append(item)
+
     log.info("Fetched %d content items", len(items))
-    return items
+    return items, parent_attachments
+
+
+def _resolve_pdf_path(attachments: list[dict], storage_path: str):
+    """Return path to first existing PDF attachment, or None."""
+    from pathlib import Path as _Path
+    for att in attachments:
+        if att.get("contentType") != "application/pdf":
+            continue
+        link_mode = att.get("linkMode", "")
+        if link_mode == "linked_file":
+            p = _Path(att.get("path", ""))
+            if p.exists():
+                return p
+        elif link_mode == "imported_file":
+            key = att.get("key", "")
+            filename = att.get("filename", "")
+            if key and filename:
+                p = _Path(storage_path) / key / filename
+                if p.exists():
+                    return p
+    return None
+
+
+def extract_pdf_snippet(pdf_path, log: logging.Logger) -> dict:
+    """Extract title guess and abstract snippet from first 3 pages of PDF.
+
+    Returns dict with 'title' and 'abstract' keys (empty strings if not found).
+    """
+    result = {"title": "", "abstract": ""}
+    try:
+        import PyPDF2
+    except ImportError:
+        return result
+
+    full_text = ""
+    try:
+        with open(pdf_path, "rb") as f:
+            reader = PyPDF2.PdfReader(f, strict=False)
+            pages_to_check = min(3, len(reader.pages))
+            for i in range(pages_to_check):
+                try:
+                    full_text += (reader.pages[i].extract_text() or "") + "\n"
+                except Exception:
+                    continue
+    except Exception as exc:
+        log.debug("PDF read error for %s: %s", pdf_path.name, exc)
+        return result
+
+    if not full_text:
+        return result
+
+    lines = [ln.strip() for ln in full_text.splitlines() if ln.strip()]
+
+    # Title: first non-trivial line (>10 chars, not a code/number pattern)
+    for line in lines[:10]:
+        if len(line) > 10 and not re.match(r'^(10\.\d{4}|PII|doi)', line, re.IGNORECASE):
+            result["title"] = line[:120]
+            break
+
+    # Abstract: text between "Abstract" keyword and next section boundary
+    abstract_m = re.search(r'\bAbstract\b', full_text, re.IGNORECASE)
+    if abstract_m:
+        text_after = full_text[abstract_m.end():]
+        boundary_m = re.search(
+            r'\n\s*(?:\d[\.\s]|Introduction|Keywords?|JEL|I\.\s)',
+            text_after, re.IGNORECASE,
+        )
+        if boundary_m:
+            text_after = text_after[:boundary_m.start()]
+        abstract = re.sub(r'\s+', ' ', text_after).strip().lstrip(':').strip()
+        if len(abstract) >= 50:
+            result["abstract"] = abstract[:500]  # show snippet in review
+
+    return result
 
 
 def match_title(candidate: str, zotero_items: list[dict], threshold: float) -> list[dict]:
@@ -237,26 +326,34 @@ def delete_item_with_retry(zot, item: dict, log: logging.Logger) -> bool:
 # Interactive review loop
 # ---------------------------------------------------------------------------
 
-def _item_summary(item: dict) -> str:
+def _item_summary(item: dict, pdf_snippet: dict | None = None) -> str:
     data = item.get("data", {})
     title = data.get("title", "(no title)")[:70]
     year = data.get("date", "")[:4] or "?"
     item_type = data.get("itemType", "?")
     doi = data.get("DOI", "") or "(no DOI)"
     date_added = data.get("dateAdded", "")[:10] or "?"
-    return (
-        f"  Title:      {title}\n"
-        f"  Year:       {year}\n"
-        f"  Type:       {item_type}\n"
-        f"  DOI:        {doi}\n"
-        f"  Added:      {date_added}"
-    )
+    lines = [
+        f"  Title:      {title}",
+        f"  Year:       {year}",
+        f"  Type:       {item_type}",
+        f"  DOI:        {doi}",
+        f"  Added:      {date_added}",
+    ]
+    if pdf_snippet:
+        if pdf_snippet.get("title"):
+            lines.append(f"  PDF title:  {pdf_snippet['title'][:70]}")
+        if pdf_snippet.get("abstract"):
+            lines.append(f"  PDF abstr:  {pdf_snippet['abstract'][:120]}…")
+    return "\n".join(lines)
 
 
 def review_candidates(
     candidates: list[dict],       # list of {label, zotero_item}
     zot,
     log: logging.Logger,
+    parent_attachments: dict | None = None,
+    storage_path: str = "",
 ) -> tuple[int, int]:
     """Run interactive d/k/s review. Returns (deleted_count, kept_count)."""
     deleted = 0
@@ -269,9 +366,18 @@ def review_candidates(
         data = item.get("data", {})
         title = data.get("title", "(no title)")[:70]
 
+        # Try to extract PDF snippet for context
+        pdf_snippet = None
+        if parent_attachments and storage_path:
+            item_key = item.get("key", "")
+            attachments = parent_attachments.get(item_key, [])
+            pdf_path = _resolve_pdf_path(attachments, storage_path)
+            if pdf_path:
+                pdf_snippet = extract_pdf_snippet(pdf_path, log)
+
         print()
         print(f"[{i}/{total}]  Source: {label}")
-        print(_item_summary(item))
+        print(_item_summary(item, pdf_snippet))
         print()
 
         while True:
@@ -318,9 +424,10 @@ def main() -> None:
     zot = connect_zotero(config, log)
 
     harvest_path = Path(config["harvest_progress_path"])
+    storage_path = config.get("zotero_storage_path", "")
     delete_titles, low_conf_items = parse_harvest_progress(harvest_path, log)
 
-    zotero_items = fetch_zotero_items(zot, log)
+    zotero_items, parent_attachments = fetch_zotero_items(zot, log)
 
     # Build review queue
     candidates: list[dict] = []
@@ -368,7 +475,9 @@ def main() -> None:
     print(f"  Deletions backed up to: {DELETIONS_LOG}")
     print("=" * 60)
 
-    deleted, kept = review_candidates(candidates, zot, log)
+    deleted, kept = review_candidates(candidates, zot, log,
+                                      parent_attachments=parent_attachments,
+                                      storage_path=storage_path)
 
     print()
     print("=" * 60)

@@ -129,6 +129,64 @@ def _reconstruct_abstract(inverted_index: dict) -> str:
     return " ".join(word for _, word in positions)
 
 
+def _parse_pdf_path_from_note(content: str):
+    """Extract PDF path from note's PDF Location metadata line."""
+    m = re.search(r'\*\*PDF Location\*\*:.*?`([^`]+)`', content)
+    if not m:
+        return None
+    from pathlib import Path
+    path = Path(m.group(1).strip())
+    return path if path.exists() else None
+
+
+def extract_abstract_from_pdf(pdf_path, log: logging.Logger) -> str | None:
+    """Extract abstract text from first 3 pages of a PDF.
+
+    Finds the "Abstract" keyword and takes text until the next section
+    boundary (Introduction, Keywords, JEL, numbered heading).
+    Returns None if extraction fails or yields too little text.
+    """
+    try:
+        import PyPDF2
+    except ImportError:
+        log.debug("PyPDF2 not installed — cannot extract from PDF")
+        return None
+
+    full_text = ""
+    try:
+        with open(pdf_path, "rb") as f:
+            reader = PyPDF2.PdfReader(f, strict=False)
+            pages_to_check = min(3, len(reader.pages))
+            for i in range(pages_to_check):
+                try:
+                    full_text += (reader.pages[i].extract_text() or "") + "\n"
+                except Exception:
+                    continue
+    except Exception as exc:
+        log.debug("PDF read error for %s: %s", pdf_path.name, exc)
+        return None
+
+    if not full_text:
+        return None
+
+    abstract_m = re.search(r'\bAbstract\b', full_text, re.IGNORECASE)
+    if not abstract_m:
+        return None
+
+    text_after = full_text[abstract_m.end():]
+    boundary_m = re.search(
+        r'\n\s*(?:\d[\.\s]|Introduction|Keywords?|JEL|I\.\s)',
+        text_after, re.IGNORECASE,
+    )
+    if boundary_m:
+        text_after = text_after[:boundary_m.start()]
+
+    abstract = re.sub(r'\s+', ' ', text_after).strip().lstrip(':').strip()
+    if len(abstract) < 50:
+        return None
+    return abstract[:3000]
+
+
 def fetch_abstract_from_openalex(doi: str, log: logging.Logger) -> str | None:
     """Fetch abstract from OpenAlex by DOI. Returns plain text or None."""
     import urllib.parse
@@ -472,8 +530,17 @@ def main() -> None:
                 if abstract:
                     abstract_source = "OpenAlex"
 
+        # Abstract source 3: PDF fallback
         if not abstract:
-            log.info("Skipping %r: no abstract in Zotero or OpenAlex", md_file.stem[:60])
+            pdf_path = _parse_pdf_path_from_note(content)
+            if pdf_path:
+                log.info("No abstract found for %r — trying PDF...", md_file.stem[:50])
+                abstract = extract_abstract_from_pdf(pdf_path, log) or ""
+                if abstract:
+                    abstract_source = "PDF"
+
+        if not abstract:
+            log.info("Skipping %r: no abstract in Zotero, OpenAlex, or PDF", md_file.stem[:60])
             skipped_no_abstract += 1
             continue
 
@@ -481,8 +548,9 @@ def main() -> None:
 
     from_zotero = sum(1 for _, _, _, src in eligible if src == "Zotero")
     from_openalex = sum(1 for _, _, _, src in eligible if src == "OpenAlex")
-    log.info("Eligible: %d  (Zotero abstract: %d, OpenAlex abstract: %d, no abstract: %d, has content: %d)",
-             len(eligible), from_zotero, from_openalex, skipped_no_abstract, skipped_has_content)
+    from_pdf = sum(1 for _, _, _, src in eligible if src == "PDF")
+    log.info("Eligible: %d  (Zotero: %d, OpenAlex: %d, PDF: %d, no abstract: %d, has content: %d)",
+             len(eligible), from_zotero, from_openalex, from_pdf, skipped_no_abstract, skipped_has_content)
 
     if args.dry_run:
         print()
@@ -492,6 +560,7 @@ def main() -> None:
         print()
         print(f"  Abstract from Zotero:     {from_zotero}")
         print(f"  Abstract from OpenAlex:   {from_openalex}")
+        print(f"  Abstract from PDF:        {from_pdf}")
         print(f"  Skipped (no abstract):    {skipped_no_abstract}")
         print(f"  Skipped (has content):    {skipped_has_content}")
         return
