@@ -627,7 +627,8 @@ def review_candidates(
                                 print("  → Zotero item updated from OpenAlex.")
                             else:
                                 print("  → No changes applied (fields already filled or error).")
-                # loop back so user can still d/k/s this item
+                kept += 1
+                break
             elif choice == "s":
                 print("Stopping review.")
                 return deleted, kept
